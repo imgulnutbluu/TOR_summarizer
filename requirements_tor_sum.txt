@@ -1,0 +1,8 @@
+streamlit
+PyPDF2
+pymupdf
+pytesseract
+numpy
+python-docx
+reportlab
+requests
