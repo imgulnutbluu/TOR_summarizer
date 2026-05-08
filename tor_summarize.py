@@ -6,24 +6,7 @@ from docx.shared import Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
-from reportlab.lib.styles import ParagraphStyle
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import cm
-from reportlab.lib import colors
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
 import os as _os
-
-def _register_fonts():
-    for p in ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "C:/Windows/Fonts/tahoma.ttf"]:
-        if _os.path.exists(p):
-            pdfmetrics.registerFont(TTFont("ThaiFont", p)); break
-    for p in ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "C:/Windows/Fonts/tahomabd.ttf"]:
-        if _os.path.exists(p):
-            pdfmetrics.registerFont(TTFont("ThaiFont-Bold", p)); break
-
-_register_fonts()
 import io, zipfile, re, json as _json
 import requests as _requests
 import pytesseract
@@ -83,6 +66,7 @@ with st.sidebar:
 
 # Helper
 def find_tor_in_zip(zip_bytes):
+    """คืน list ของทุกไฟล์ TOR แล้วค่อยส่งให้ Ollama สรุป"""
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
         names = z.namelist()
         priority = []
@@ -97,19 +81,41 @@ def find_tor_in_zip(zip_bytes):
                 priority.append((1, name))
             elif "tor" in lower:
                 priority.append((2, name))
-
         if not priority:
-            biggest_pdf = max((n for n in names if n.lower().endswith(".pdf")), key=lambda x: z.getinfo(x).file_size, default=None)
-            if biggest_pdf:
-                return z.read(biggest_pdf), biggest_pdf.split("/")[-1]
-            return None, ""
+            biggest = max((n for n in names if n.lower().endswith(".pdf")),
+                          key=lambda x: z.getinfo(x).file_size, default=None)
+            if biggest:
+                return [(z.read(biggest), biggest.split("/")[-1])]
+            return []
         priority.sort()
-        chosen = priority[0][1]
-        return z.read(chosen), chosen.split("/")[-1]
+        return [(z.read(name), name.split("/")[-1]) for _, name in priority]
 
 def get_project_id(zip_name):
     match = re.match(r"(\d+)", zip_name)
     return match.group(1) if match else zip_name.replace(".zip", "")
+
+# หมุนเอกสารถ้าเจอว่าหมุนอยู่
+def rotate_pdf_if_needed(file_bytes):
+    try:
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+    except Exception:
+        return file_bytes
+
+    rotated = False
+    for page in doc:
+        if page.rotation in (90, 180, 270): # องศาที่หมุนอยู่
+            page.set_rotation(0) # ปรับเป็น 0 องศา
+            rotated = True
+            #st.info(f"หมุนหน้า {page.number + 1}")
+
+    if rotated:
+        out_bytes = io.BytesIO()
+        doc.save(out_bytes)
+        doc.close()
+        return out_bytes.getvalue()
+
+    doc.close()
+    return file_bytes
 
 def extract_text_from_pdf(file_bytes):
     try:
@@ -238,7 +244,6 @@ def extract_budget_by_regex(text: str) -> dict:
             else:
                 result["duration"] = f"{groups[0]} {groups[1]}"
             break
-
     return result
 
 def summarize_tor(text, api_key="", project_id=""):
@@ -248,7 +253,7 @@ def summarize_tor(text, api_key="", project_id=""):
     budget_total = extracted.get("budget_total", "")
     duration_fact = extracted["duration"] or "ไม่พบในเอกสาร"
 
-    # สร้างข้อความงบประมาณ — แสดงวงเงินปีนี้เป็นหลัก + วงเงินรวมถ้ามี
+    # แสดงวงเงินปีนี้เป็นหลัก + วงเงินรวม(ถ้ามี)
     if budget_total:
         budget_display = f"{budget_fact} (วงเงินโครงการรวม: {budget_total})"
     else:
@@ -370,14 +375,22 @@ def build_combined_excel(results):
         })
     df = pd.DataFrame(data)
     buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
-        df.to_excel(writer, index=False, sheet_name="TOR Summary")
-        ws = writer.sheets["TOR Summary"]
-        ws.set_column("A:A", 20)
-        ws.set_column("B:B", 30)
-        ws.set_column("C:D", 20)
-        ws.set_column("E:E", 15)
-        ws.set_column("F:F", 100)
+    try:
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+            df.to_excel(writer, index=False, sheet_name="TOR Summary")
+            ws = writer.sheets["TOR Summary"]
+            ws.set_column("A:A", 20)
+            ws.set_column("B:B", 30)
+            ws.set_column("C:D", 20)
+            ws.set_column("E:E", 15)
+            ws.set_column("F:F", 100)
+    except ImportError:
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="TOR Summary")
+            ws = writer.sheets["TOR Summary"]
+            widths = {"A": 20, "B": 30, "C": 20, "D": 20, "E": 15, "F": 100}
+            for col, width in widths.items():
+                ws.column_dimensions[col].width = width
     buf.seek(0)
     return buf.getvalue()
 
@@ -387,25 +400,37 @@ def process_one(uploaded_file):
     file_bytes = uploaded_file.read()
     if name.lower().endswith(".zip"):
         project_id = get_project_id(name)
-        tor_bytes, tor_filename = find_tor_in_zip(file_bytes)
-        if tor_bytes is None:
+        tor_files = find_tor_in_zip(file_bytes)
+        if not tor_files:
             st.error(f"ไม่พบไฟล์ TOR ใน {name}")
             return None
-        st.success(f"**{project_id}** — พบ {tor_filename}")
-        pdf_bytes = tor_bytes
-        source_label = tor_filename
+        filenames = [fn for _, fn in tor_files]
+        st.success(f"**{project_id}** — พบ TOR {len(tor_files)} ไฟล์: {', '.join(filenames)}")
+        # รวม text จากทุกไฟล์ TOR
+        all_texts = []
+        for pdf_b, fn in tor_files:
+            pdf_b = rotate_pdf_if_needed(pdf_b)
+            t = extract_text_from_pdf(pdf_b)
+            if t and len(t) > 100:
+                st.info(f"{fn} — อ่านข้อความโดยตรง")
+                all_texts.append(f"=== {fn} ===\n{t}")
+            else:
+                st.info(f"{fn} — PDF สแกน, OCR ด้วย Tesseract")
+                t = ocr_with_tesseract(pdf_b, label=fn)
+                all_texts.append(f"=== {fn} ===\n{t}")
+        text = "\n\n".join(all_texts)
+        source_label = ", ".join(filenames)
     else:
         project_id = name.replace(".pdf", "")
-        pdf_bytes = file_bytes
+        pdf_bytes = rotate_pdf_if_needed(file_bytes)
         source_label = name
         st.success(f"**{project_id}**")
-
-    text = extract_text_from_pdf(pdf_bytes)
-    if not (text and len(text) > 100):
-        st.info("PDF สแกน — OCR ด้วย Tesseract")
-        text = ocr_with_tesseract(pdf_bytes, label=project_id)
-    else:
-        st.info("PDF พิมพ์ — อ่านข้อความโดยตรง")
+        text = extract_text_from_pdf(pdf_bytes)
+        if not (text and len(text) > 100):
+            st.info("PDF สแกน — OCR ด้วย Tesseract")
+            text = ocr_with_tesseract(pdf_bytes, label=project_id)
+        else:
+            st.info("PDF พิมพ์ — อ่านข้อความโดยตรง")
 
     summary = summarize_tor(text, project_id=project_id)
     return {"project_id": project_id, "source": source_label, "summary": summary}
