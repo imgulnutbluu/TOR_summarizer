@@ -65,30 +65,53 @@ with st.sidebar:
     st.caption("**Tesseract** — OCR", help="ใช้สำหรับอ่านข้อความจาก PDF ที่เป็นสแกนภาพเท่านั้น ดาวน์โหลดได้ที่ https://github.com/UB-Mannheim/tesseract/wiki")
 
 # Helper
+# ชื่อไฟล์ที่รู้ชัดว่าไม่ใช่ TOR
+_NOT_TOR = [
+    "contract", "bond", "quotation", "bidding", "notice", "noltice",
+    "performance", "advance", "payment", "action_plan", "action",
+    "definition", "verification", "integrity", "pact", "bid", "spec",
+    "สัญญา", "ประกาศ", "ใบเสนอ", "แบบ",
+]
+
+def _is_not_tor(filename: str) -> bool:
+    lower = filename.lower()
+    return any(kw in lower for kw in _NOT_TOR)
+
 def find_tor_in_zip(zip_bytes):
-    """คืน list ของทุกไฟล์ TOR แล้วค่อยส่งให้ Ollama สรุป"""
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
         names = z.namelist()
-        priority = []
-        for name in names:
+        pdfs = [n for n in names if n.lower().endswith(".pdf")]
+
+        # หาจากชื่อที่มีคำว่า tor ก่อน
+        tor_files = []
+        for name in pdfs:
             lower = name.lower()
-            basename = name.split("/")[-1]
-            if not basename.endswith(".pdf"):
-                continue
             if "attach_tor" in lower:
-                priority.append((0, name))
+                tor_files.append((0, name))
             elif lower.startswith("tor") or "_tor" in lower or "tor_" in lower:
-                priority.append((1, name))
+                tor_files.append((1, name))
             elif "tor" in lower:
-                priority.append((2, name))
-        if not priority:
-            biggest = max((n for n in names if n.lower().endswith(".pdf")),
-                          key=lambda x: z.getinfo(x).file_size, default=None)
-            if biggest:
-                return [(z.read(biggest), biggest.split("/")[-1])]
-            return []
-        priority.sort()
-        return [(z.read(name), name.split("/")[-1]) for _, name in priority]
+                tor_files.append((2, name))
+
+        if tor_files:
+            tor_files.sort()
+            return [(z.read(n), n.split("/")[-1]) for _, n in tor_files]
+
+        # กรองที่รู้ว่าไม่ใช่ TOR ออก แล้วเอาที่เหลือ
+        candidates = [
+            (z.getinfo(n).file_size, n)
+            for n in pdfs
+            if not _is_not_tor(n.split("/")[-1])
+        ]
+        if candidates:
+            candidates.sort(reverse=True)  # ใหญ่สุดก่อน
+            return [(z.read(n), n.split("/")[-1]) for _, n in candidates]
+
+        # ไฟล์ใหญ่ที่สุด
+        if pdfs:
+            biggest = max(pdfs, key=lambda x: z.getinfo(x).file_size)
+            return [(z.read(biggest), biggest.split("/")[-1])]
+        return []
 
 def get_project_id(zip_name):
     match = re.match(r"(\d+)", zip_name)
@@ -268,7 +291,7 @@ def summarize_tor(text, api_key="", project_id=""):
 **วัตถุประสงค์** (2-3 บรรทัด)
 **ขอบเขตงาน** (2-3 บรรทัด)
 **คุณสมบัติผู้รับจ้าง** (หลักๆ)
-**คุณลักษณะเฉพาะของครุภัณฑ์/งาน/สิ่ง ที่กล่าวถึงในหัวข้อโครงการ**
+**คุณลักษณะของครุภัณฑ์ หรืองาน หรือสิ่ง ที่กล่าวถึงในหัวข้อโครงการ**
 **วงเงินงบประมาณ:** {budget_display}
 **ระยะเวลาดำเนินงาน:** {duration_fact}
 **เงื่อนไขสำคัญ** (2-3 ข้อ)
@@ -301,10 +324,10 @@ def summarize_tor(text, api_key="", project_id=""):
         status.empty()
         return result
     except _requests.exceptions.ConnectionError:
-        st.error("❌ ไม่พบ Ollama — กรุณาเปิด Ollama ก่อนแล้วลองใหม่")
+        st.error("ไม่พบ Ollama — กรุณาเปิด Ollama ก่อนแล้วลองใหม่")
         return ""
     except Exception as e:
-        st.error(f"❌ Ollama error: {e}")
+        st.error(f"Ollama error: {e}")
         return ""
 
 # Export Word
