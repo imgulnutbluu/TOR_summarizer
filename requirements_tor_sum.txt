@@ -4,5 +4,7 @@ pymupdf
 pytesseract
 numpy
 python-docx
-reportlab
 requests
+pandas
+openpyxl
+xlsxwriter
