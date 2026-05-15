@@ -107,7 +107,7 @@ def find_tor_in_zip(zip_bytes):
             candidates.sort(reverse=True)  # ใหญ่สุดก่อน
             return [(z.read(n), n.split("/")[-1]) for _, n in candidates]
 
-        # ไฟล์ใหญ่ที่สุด
+        # ไฟล์ที่ใหญ่ที่สุด
         if pdfs:
             biggest = max(pdfs, key=lambda x: z.getinfo(x).file_size)
             return [(z.read(biggest), biggest.split("/")[-1])]
@@ -129,7 +129,6 @@ def rotate_pdf_if_needed(file_bytes):
         if page.rotation in (90, 180, 270): # องศาที่หมุนอยู่
             page.set_rotation(0) # ปรับเป็น 0 องศา
             rotated = True
-            #st.info(f"หมุนหน้า {page.number + 1}")
 
     if rotated:
         out_bytes = io.BytesIO()
@@ -162,7 +161,12 @@ def ocr_with_tesseract(file_bytes, label=""):
         page = doc[i]
         pix = page.get_pixmap(matrix=fitz.Matrix(200/72, 200/72))
         img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
-        text = pytesseract.image_to_string(img, lang="tha+eng", config="--psm 3")
+        # oem 1 = LSTM, psm 6 = block of text — แม่นกว่าสำหรับเอกสารราชการไทย
+        # preserve_interword_spaces ช่วยแก้ตัวอักษรติดกัน เช่น A๒ → A 2
+        text = pytesseract.image_to_string(
+            img, lang="tha+eng",
+            config="--oem 1 --psm 6 -c preserve_interword_spaces=1"
+        )
         all_text.append(text)
         progress.progress((i + 1) / total, text=f"OCR หน้า {i+1}/{total}")
     progress.empty()
@@ -178,10 +182,10 @@ def extract_budget_by_regex(text: str) -> dict:
     """
     ดึงงบประมาณและระยะเวลา
     - budget_annual = วงเงินที่ได้รับจัดสรร/ปีนี้ (หลัก)
-    - budget_total  = วงเงินโครงการรวมทั้งหมด (ถ้ามี)
+
     - รองรับเลขไทย/อารบิก
     """
-    result = {"budget": "", "budget_total": "", "duration": ""}
+    result = {"budget": "", "duration": ""}
     t = _to_arabic(text)
     N = r"[\d,]+(?:\.[\d]+)?"
 
@@ -218,17 +222,6 @@ def extract_budget_by_regex(text: str) -> dict:
         (rf"({N})\s*บาท", False),
     ]
 
-    # วงเงินโครงการรวมทั้งหมด (ถ้ามี)
-    total_pats = [
-        (rf"กรอบวงเงิน[^0-9\n]{{0,30}}({N})\s*ล้านบาท", True),
-        (rf"วงเงินโครงการ[^0-9\n]{{0,30}}({N})\s*ล้านบาท", True),
-        (rf"วงเงินรวม[^0-9\n]{{0,30}}({N})\s*ล้านบาท", True),
-        (rf"วงเงินทั้งสิ้น[^0-9\n]{{0,30}}({N})\s*ล้านบาท", True),
-        (rf"วงเงินงบประมาณ[^0-9\n]{{0,30}}({N})\s*ล้านบาท", True),
-        (rf"เป็นเงิน\s*({N})\s*ล้านบาท", True),
-        (rf"({N})\s*ล้านบาท", True),
-    ]
-
     def find_num(pats, search_text):
         for pat, is_million in pats:
             m = re.search(pat, search_text)
@@ -244,11 +237,6 @@ def extract_budget_by_regex(text: str) -> dict:
         return ""
 
     result["budget"] = find_num(annual_pats, budget_text)
-    result["budget_total"] = find_num(total_pats, budget_text)
-
-    # ถ้าสองค่าเหมือนกัน ไม่ต้องแสดง budget_total ซ้ำ
-    if result["budget"] == result["budget_total"]:
-        result["budget_total"] = ""
 
     dur_pats = [
         rf"ผูกพัน[^0-9\n]{{0,30}}([\d]+)\s*เดือน",
@@ -269,49 +257,47 @@ def extract_budget_by_regex(text: str) -> dict:
             break
     return result
 
-def summarize_tor(text, api_key="", project_id=""):
-    # ดึงงบ/ระยะเวลาด้วย regex 
-    extracted = extract_budget_by_regex(text)
-    budget_fact = extracted["budget"] or "ไม่พบในเอกสาร"
-    budget_total = extracted.get("budget_total", "")
-    duration_fact = extracted["duration"] or "ไม่พบในเอกสาร"
+def _extract_spec_section(text: str) -> str:
+    """ดึงเฉพาะส่วนคุณลักษณะเฉพาะ/สเปค จาก TOR"""
+    triggers = [
+        "คุณลักษณะเฉพาะ", "คุณลักษณะทางเทคนิค", "รายละเอียดคุณลักษณะ",
+        "ข้อกำหนดคุณลักษณะ", "specification", "คุณสมบัติของ",
+        "รายละเอียดของ", "ลักษณะของ",
+    ]
+    stop_triggers = [
+        "คุณสมบัติผู้รับจ้าง", "วงเงิน", "งบประมาณ", "ระยะเวลา",
+        "เงื่อนไข", "การชำระ", "การส่งมอบ", "การตรวจรับ",
+    ]
+    lines = text.split("\n")
+    in_spec = False
+    spec_lines = []
+    for line in lines:
+        if not in_spec and any(kw in line for kw in triggers):
+            in_spec = True
+        if in_spec:
+            if any(kw in line for kw in stop_triggers) and spec_lines:
+                break
+            spec_lines.append(line)
+        if in_spec and len(spec_lines) > 400:
+            break
+    return "\n".join(spec_lines) if spec_lines else ""
 
-    # แสดงวงเงินปีนี้เป็นหลัก + วงเงินรวม(ถ้ามี)
-    if budget_total:
-        budget_display = f"{budget_fact} (วงเงินโครงการรวม: {budget_total})"
-    else:
-        budget_display = budget_fact
 
-    prompt = f"""คุณเป็นผู้เชี่ยวชาญด้านการวิเคราะห์เอกสาร TOR ภาษาไทย
-สรุปเอกสารต่อไปนี้เป็นภาษาไทย แบ่งเป็นหัวข้อ:
-
-**รหัสโครงการ:** {project_id}
-**ชื่อโครงการ**
-**หน่วยงาน**
-**วัตถุประสงค์** (2-3 บรรทัด)
-**ขอบเขตงาน** (2-3 บรรทัด)
-**คุณสมบัติผู้รับจ้าง** (หลักๆ)
-**คุณลักษณะของครุภัณฑ์ หรืองาน หรือสิ่ง ที่กล่าวถึงในหัวข้อโครงการ**
-**วงเงินงบประมาณ:** {budget_display}
-**ระยะเวลาดำเนินงาน:** {duration_fact}
-**เงื่อนไขสำคัญ** (2-3 ข้อ)
-
-เนื้อหาเอกสาร:
-{text[:3000]}
-"""
+def _ollama_generate(prompt: str, status_text: str = "Ollama กำลังสรุป ...") -> str:
+    """เรียก Ollama และ return ผลลัพธ์ string"""
+    status = st.empty()
+    status.info(status_text)
     try:
-        status = st.empty()
-        status.info("Ollama กำลังสรุป ...")
         resp = _requests.post(
             "http://localhost:11434/api/generate",
             json={
                 "model": "llama3.2",
                 "prompt": prompt,
                 "stream": True,
-                "options": {"num_predict": 1200, "num_ctx": 4096, "temperature": 0.1}
+                "options": {"num_predict": 6000, "num_ctx": 8192, "temperature": 0.1}
             },
             stream=True,
-            timeout=(10, 1200)
+            timeout=(10, 1800)
         )
         resp.raise_for_status()
         result = ""
@@ -324,11 +310,64 @@ def summarize_tor(text, api_key="", project_id=""):
         status.empty()
         return result
     except _requests.exceptions.ConnectionError:
+        status.empty()
         st.error("ไม่พบ Ollama — กรุณาเปิด Ollama ก่อนแล้วลองใหม่")
         return ""
     except Exception as e:
+        status.empty()
         st.error(f"Ollama error: {e}")
         return ""
+
+
+def summarize_tor(text, api_key="", project_id=""):
+    # ดึงงบ/ระยะเวลาด้วย regex
+    extracted = extract_budget_by_regex(text)
+    budget_fact = extracted["budget"] or "ไม่พบในเอกสาร"
+    duration_fact = extracted["duration"] or "ไม่พบในเอกสาร"
+
+    # รอบที่ 1 ดึงคุณลักษณะเฉพาะทั้งหมด
+    spec_section = _extract_spec_section(text)
+    spec_text = spec_section if spec_section else text[2000:8000]  # fallback ใช้กลางเอกสาร
+
+    spec_prompt = f"""คุณเป็นผู้ช่วยวิเคราะห์เอกสาร TOR ภาษาไทย
+อ่านส่วนคุณลักษณะเฉพาะด้านล่าง แล้วสกัดทุกข้อทุกรายการออกมาเป็น bullet point ภาษาไทย
+กฎ:
+- ระบุทุกข้อ ห้ามข้ามหรือรวมข้อ
+- แต่ละข้อย่อให้กระชับแต่คงตัวเลข หน่วย มาตรฐาน ครบถ้วน
+- ห้ามแต่งหรือเดาข้อมูลที่ไม่มีในเอกสาร
+- ตอบเป็น bullet point เท่านั้น ไม่ต้องมีคำนำหรือสรุปท้าย
+
+เนื้อหา:
+{spec_text}
+"""
+    spec_result = _ollama_generate(spec_prompt, "กำลังดึงคุณลักษณะเฉพาะ")
+
+    # รอบที่ 2 สรุปส่วนที่เหลือ
+    text_head = text[:4000]
+    text_tail = text[-1500:] if len(text) > 4000 else ""
+    text_for_llm = text_head + ("\n\n[...]\n\n" + text_tail if text_tail else "")
+
+    summary_prompt = f"""คุณเป็นผู้เชี่ยวชาญด้านการวิเคราะห์เอกสาร TOR (Terms of Reference) ภาษาไทย
+อ่านเนื้อหาต่อไปนี้แล้วสรุปเป็นภาษาไทย แบ่งเป็นหัวข้อดังนี้:
+
+**รหัสโครงการ:** {project_id}
+**ชื่อโครงการ**
+**หน่วยงาน**
+**วัตถุประสงค์** (2-3 บรรทัด)
+**ขอบเขตงาน** (2-3 บรรทัด)
+**คุณสมบัติผู้รับจ้าง** (เฉพาะข้อสำคัญ)
+**คุณลักษณะเฉพาะ** {spec_result}
+**วงเงินงบประมาณ:** {budget_fact}
+**ระยะเวลาดำเนินงาน:** {duration_fact}
+**เงื่อนไขสำคัญ** (2-3 ข้อ)
+
+⚠️ วงเงินงบประมาณและระยะเวลา: ใช้ค่าที่กำหนดข้างต้นเท่านั้น ห้ามเปลี่ยนแปลง
+⚠️ คุณลักษณะเฉพาะ: ใช้ข้อความที่ได้จากรอบที่ 1 ด้านบนทั้งหมด ห้ามตัดหรือย่อเพิ่ม
+
+เนื้อหาเอกสาร:
+{text_for_llm}
+"""
+    return _ollama_generate(summary_prompt, "กำลังสรุปทั้งหมด...")
 
 # Export Word
 def add_page_break(doc):
@@ -392,7 +431,6 @@ def build_combined_excel(results):
             "project_id": r["project_id"],
             "source_file": r["source"],
             "budget": extracted["budget"],
-            "budget_total": extracted.get("budget_total", ""),
             "duration": extracted["duration"],
             "summary": r["summary"]
         })
