@@ -44,24 +44,59 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
+_SUPPORTED_MODELS = {
+    "llama3.2":                                          "LLaMA 3.2",
+    "hf.co/nectec/Pathumma-llm-text-1.0.0:Q4_K_M":     "Pathumma 7B (NECTEC)",
+    "hf.co/nectec/thai-research-gemma-3-27b-it:Q4_K_M": "Pathumma 27B Gemma (NECTEC)",
+}
+
 with st.sidebar:
     try:
         _r = _requests.get("http://localhost:11434/api/tags", timeout=2)
-        _models = [m["name"] for m in _r.json().get("models", [])]
-        if any("llama3.2" in m for m in _models):
-            st.success("Ollama พร้อมใช้งาน (llama3.2)")
-        else:
-            st.warning("⚠️ Ollama รันอยู่ แต่ยังไม่มีโมเดล\nรัน: `ollama pull llama3.2`")
+        _installed = [m["name"] for m in _r.json().get("models", [])]
+        _ollama_ok = True
     except Exception:
-        st.error("Ollama ไม่ได้รัน\nเปิดโปรแกรม Ollama ก่อน")
-    st.divider()
+        _installed = []
+        _ollama_ok = False
 
+    if not _ollama_ok:
+        st.error("Ollama ไม่ได้รัน\nเปิดโปรแกรม Ollama ก่อน")
+    elif not _installed:
+        st.warning("⚠️ Ollama รันอยู่ แต่ยังไม่มีโมเดล")
+    else:
+        st.success(f"Ollama พร้อมใช้งาน ({len(_installed)} โมเดล)")
+
+    st.divider()
+    st.header("เลือกโมเดล")
+
+    _available = [m for m in _installed if m] or ["llama3.2"]
+    def _make_label(m):
+        if m in _SUPPORTED_MODELS:
+            return _SUPPORTED_MODELS[m]
+        return m.split("/")[-1].replace(":latest", "").replace(":Latest", "")
+    _labels = [_make_label(m) for m in _available]
+    _label_to_model = dict(zip(_labels, _available))
+
+    _default_label = next(
+        (lb for lb, md in _label_to_model.items() if "pathumma" in md.lower() or "nectec" in md.lower()),
+        next((lb for lb, md in _label_to_model.items() if "llama3.2" in md), _labels[0])
+    )
+    _chosen_label = st.selectbox(
+        "โมเดลสำหรับสรุป", options=_labels,
+        index=_labels.index(_default_label),
+        help="เลือกโมเดล LLM ที่ติดตั้งใน Ollama"
+    )
+    SELECTED_MODEL = _label_to_model[_chosen_label]
+
+    if SELECTED_MODEL not in _installed:
+        st.info(f"ติดตั้งโมเดลนี้ด้วย:\n`ollama pull {SELECTED_MODEL}`")
+
+    st.divider()
     st.header("📂 เกี่ยวกับเว็บไซต์")
     st.caption("เว็บไซต์นี้เป็นเครื่องมือเพื่อช่วยสรุปเอกสาร Terms of Reference (TOR) อัตโนมัติเพื่อลดเวลาและภาระในการสรุปเอกสารทั้งหมด พร้อมนำออกในรูปแบบ Word/PDF รวมทุกโครงการ\n\n**หมายเหตุ:** ผลลัพธ์ที่ได้อาจมีความคลาดเคลื่อน ควรตรวจสอบกับเอกสารต้นฉบับอีกครั้ง")
     st.divider()
-
     st.header("🛠️ เครื่องมือที่ใช้")
-    st.caption("**Ollama llama3.2** — สรุป",help="ใช้โมเดลภาษา LLaMA 3.2 ผ่าน Ollama ในการสรุปเอกสาร TOR เป็นภาษาไทย ดาวน์โหลดได้ที่ https://ollama.com/download , https://ollama.com/library/llama3.2")
+    st.caption(f"**{_chosen_label}** — สรุป")
     st.caption("**Tesseract** — OCR", help="ใช้สำหรับอ่านข้อความจาก PDF ที่เป็นสแกนภาพเท่านั้น ดาวน์โหลดได้ที่ https://github.com/UB-Mannheim/tesseract/wiki")
 
 # Helper
@@ -161,7 +196,7 @@ def ocr_with_tesseract(file_bytes, label=""):
         page = doc[i]
         pix = page.get_pixmap(matrix=fitz.Matrix(200/72, 200/72))
         img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
-        # oem 1 = LSTM, psm 6 = block of text — แม่นกว่าสำหรับเอกสารราชการไทย
+        # oem 1 = LSTM, psm 6 = block of text
         # preserve_interword_spaces ช่วยแก้ตัวอักษรติดกัน เช่น A๒ → A 2
         text = pytesseract.image_to_string(
             img, lang="tha+eng",
@@ -257,47 +292,43 @@ def extract_budget_by_regex(text: str) -> dict:
             break
     return result
 
-def _extract_spec_section(text: str) -> str:
-    """ดึงเฉพาะส่วนคุณลักษณะเฉพาะ/สเปค จาก TOR"""
-    triggers = [
-        "คุณลักษณะเฉพาะ", "คุณลักษณะทางเทคนิค", "รายละเอียดคุณลักษณะ",
-        "ข้อกำหนดคุณลักษณะ", "specification", "คุณสมบัติของ",
-        "รายละเอียดของ", "ลักษณะของ",
-    ]
-    stop_triggers = [
-        "คุณสมบัติผู้รับจ้าง", "วงเงิน", "งบประมาณ", "ระยะเวลา",
-        "เงื่อนไข", "การชำระ", "การส่งมอบ", "การตรวจรับ",
-    ]
-    lines = text.split("\n")
-    in_spec = False
-    spec_lines = []
-    for line in lines:
-        if not in_spec and any(kw in line for kw in triggers):
-            in_spec = True
-        if in_spec:
-            if any(kw in line for kw in stop_triggers) and spec_lines:
-                break
-            spec_lines.append(line)
-        if in_spec and len(spec_lines) > 400:
-            break
-    return "\n".join(spec_lines) if spec_lines else ""
+def summarize_tor(text, api_key="", project_id=""):
+    # ดึงงบ/ระยะเวลาด้วย regex 
+    extracted = extract_budget_by_regex(text)
+    budget_fact = extracted["budget"] or "ไม่พบในเอกสาร"
+    duration_fact = extracted["duration"] or "ไม่พบในเอกสาร"
 
+    prompt = f"""คุณเป็นผู้เชี่ยวชาญด้านการวิเคราะห์เอกสาร TOR (Terms of Reference) ภาษาไทย
+อ่านเนื้อหาต่อไปนี้แล้วสรุปเป็นภาษาไทย แบ่งเป็นหัวข้อดังนี้:
 
-def _ollama_generate(prompt: str, status_text: str = "Ollama กำลังสรุป ...") -> str:
-    """เรียก Ollama และ return ผลลัพธ์ string"""
-    status = st.empty()
-    status.info(status_text)
+**รหัสโครงการ:** {project_id}
+**ชื่อโครงการ**
+**หน่วยงาน**
+**วัตถุประสงค์** (2-3 บรรทัด)
+**ขอบเขตงาน** (2-3 บรรทัด)
+**คุณสมบัติผู้รับจ้าง** (เฉพาะข้อสำคัญ)
+**คุณลักษณะเฉพาะ** — สรุปสเปค/รายละเอียดคุณลักษณะทางเทคนิค เช่น ขนาด ปริมาณ มาตรฐาน ความสามารถ หรือข้อกำหนดพิเศษ ที่ระบุในเอกสาร ไม่ต้องหัวข้อตามนี้ก็ได้
+**วงเงินงบประมาณ:** {budget_fact}
+**ระยะเวลาดำเนินงาน:** {duration_fact}
+**เงื่อนไขสำคัญ** (2-3 ข้อ)
+
+เนื้อหาเอกสาร:
+{text[:3000]}
+"""
     try:
+        _model = SELECTED_MODEL if "SELECTED_MODEL" in globals() else "llama3.2"
+        status = st.empty()
+        status.info("กำลังสรุปเอกสาร... กรุณารอสักครู่")
         resp = _requests.post(
             "http://localhost:11434/api/generate",
             json={
-                "model": "llama3.2",
+                "model": _model,
                 "prompt": prompt,
                 "stream": True,
-                "options": {"num_predict": 6000, "num_ctx": 8192, "temperature": 0.1}
+                "options": {"num_predict": 1200, "num_ctx": 4096, "temperature": 0.1}
             },
             stream=True,
-            timeout=(10, 1800)
+            timeout=(10, 1200)
         )
         resp.raise_for_status()
         result = ""
@@ -310,64 +341,11 @@ def _ollama_generate(prompt: str, status_text: str = "Ollama กำลังส�
         status.empty()
         return result
     except _requests.exceptions.ConnectionError:
-        status.empty()
         st.error("ไม่พบ Ollama — กรุณาเปิด Ollama ก่อนแล้วลองใหม่")
         return ""
     except Exception as e:
-        status.empty()
         st.error(f"Ollama error: {e}")
         return ""
-
-
-def summarize_tor(text, api_key="", project_id=""):
-    # ดึงงบ/ระยะเวลาด้วย regex
-    extracted = extract_budget_by_regex(text)
-    budget_fact = extracted["budget"] or "ไม่พบในเอกสาร"
-    duration_fact = extracted["duration"] or "ไม่พบในเอกสาร"
-
-    # รอบที่ 1 ดึงคุณลักษณะเฉพาะทั้งหมด
-    spec_section = _extract_spec_section(text)
-    spec_text = spec_section if spec_section else text[2000:8000]  # fallback ใช้กลางเอกสาร
-
-    spec_prompt = f"""คุณเป็นผู้ช่วยวิเคราะห์เอกสาร TOR ภาษาไทย
-อ่านส่วนคุณลักษณะเฉพาะด้านล่าง แล้วสกัดทุกข้อทุกรายการออกมาเป็น bullet point ภาษาไทย
-กฎ:
-- ระบุทุกข้อ ห้ามข้ามหรือรวมข้อ
-- แต่ละข้อย่อให้กระชับแต่คงตัวเลข หน่วย มาตรฐาน ครบถ้วน
-- ห้ามแต่งหรือเดาข้อมูลที่ไม่มีในเอกสาร
-- ตอบเป็น bullet point เท่านั้น ไม่ต้องมีคำนำหรือสรุปท้าย
-
-เนื้อหา:
-{spec_text}
-"""
-    spec_result = _ollama_generate(spec_prompt, "กำลังดึงคุณลักษณะเฉพาะ")
-
-    # รอบที่ 2 สรุปส่วนที่เหลือ
-    text_head = text[:4000]
-    text_tail = text[-1500:] if len(text) > 4000 else ""
-    text_for_llm = text_head + ("\n\n[...]\n\n" + text_tail if text_tail else "")
-
-    summary_prompt = f"""คุณเป็นผู้เชี่ยวชาญด้านการวิเคราะห์เอกสาร TOR (Terms of Reference) ภาษาไทย
-อ่านเนื้อหาต่อไปนี้แล้วสรุปเป็นภาษาไทย แบ่งเป็นหัวข้อดังนี้:
-
-**รหัสโครงการ:** {project_id}
-**ชื่อโครงการ**
-**หน่วยงาน**
-**วัตถุประสงค์** (2-3 บรรทัด)
-**ขอบเขตงาน** (2-3 บรรทัด)
-**คุณสมบัติผู้รับจ้าง** (เฉพาะข้อสำคัญ)
-**คุณลักษณะเฉพาะ** {spec_result}
-**วงเงินงบประมาณ:** {budget_fact}
-**ระยะเวลาดำเนินงาน:** {duration_fact}
-**เงื่อนไขสำคัญ** (2-3 ข้อ)
-
-⚠️ วงเงินงบประมาณและระยะเวลา: ใช้ค่าที่กำหนดข้างต้นเท่านั้น ห้ามเปลี่ยนแปลง
-⚠️ คุณลักษณะเฉพาะ: ใช้ข้อความที่ได้จากรอบที่ 1 ด้านบนทั้งหมด ห้ามตัดหรือย่อเพิ่ม
-
-เนื้อหาเอกสาร:
-{text_for_llm}
-"""
-    return _ollama_generate(summary_prompt, "กำลังสรุปทั้งหมด...")
 
 # Export Word
 def add_page_break(doc):

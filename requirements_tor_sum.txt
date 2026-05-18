@@ -8,4 +8,4 @@ requests
 pandas
 openpyxl
 xlsxwriter
-aift
+aifts
