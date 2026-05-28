@@ -7,16 +7,9 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 import os as _os
-import io, zipfile, re, json as _json
+import io, zipfile, re, json as _json, base64
 import requests as _requests
-import pytesseract
-import numpy as np
 from datetime import datetime
-
-# Tesseract path
-_tess_win = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-if _os.path.exists(_tess_win):
-    pytesseract.pytesseract.tesseract_cmd = _tess_win
 
 st.set_page_config(page_title="TOR Summarizer", page_icon="bb.png", layout="wide")
 
@@ -47,7 +40,7 @@ st.markdown("""
 _SUPPORTED_MODELS = {
     "llama3.2":                                          "LLaMA 3.2",
     "hf.co/nectec/Pathumma-llm-text-1.0.0:Q4_K_M":     "Pathumma 7B (NECTEC)",
-    "hf.co/nectec/thai-research-gemma-3-27b-it:Q4_K_M": "Pathumma 27B Gemma (NECTEC)",
+    #"hf.co/nectec/thai-research-gemma-3-27b-it:Q4_K_M": "Pathumma 27B Gemma (NECTEC)",
 }
 
 with st.sidebar:
@@ -62,7 +55,7 @@ with st.sidebar:
     if not _ollama_ok:
         st.error("Ollama ไม่ได้รัน\nเปิดโปรแกรม Ollama ก่อน")
     elif not _installed:
-        st.warning("⚠️ Ollama รันอยู่ แต่ยังไม่มีโมเดล")
+        st.warning("Ollama รันอยู่ แต่ยังไม่มีโมเดล")
     else:
         st.success(f"Ollama พร้อมใช้งาน ({len(_installed)} โมเดล)")
 
@@ -97,7 +90,7 @@ with st.sidebar:
     st.divider()
     st.header("🛠️ เครื่องมือที่ใช้")
     st.caption(f"**{_chosen_label}** — สรุป")
-    st.caption("**Tesseract** — OCR", help="ใช้สำหรับอ่านข้อความจาก PDF ที่เป็นสแกนภาพเท่านั้น ดาวน์โหลดได้ที่ https://github.com/UB-Mannheim/tesseract/wiki")
+    st.caption("**Tesseract** — OCR")
 
 # Helper
 # ชื่อไฟล์ที่รู้ชัดว่าไม่ใช่ TOR
@@ -187,26 +180,33 @@ def extract_text_from_pdf(file_bytes):
         return ""
 
 def ocr_with_tesseract(file_bytes, label=""):
+    try:
+        import pytesseract, numpy as np
+        _tess_win = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+        if _os.path.exists(_tess_win):
+            pytesseract.pytesseract.tesseract_cmd = _tess_win
+    except ImportError:
+        st.error("ไม่พบ pytesseract — ติดตั้งด้วย: pip install pytesseract")
+        return ""
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     total = len(doc)
     all_text = []
-    progress = st.progress(0, text=f"กำลัง OCR {label} ({total} หน้า)")
-
+    progress = st.progress(0, text=f"กำลัง OCR {label} ด้วย Tesseract ({total} หน้า)")
     for i in range(total):
         page = doc[i]
         pix = page.get_pixmap(matrix=fitz.Matrix(200/72, 200/72))
         img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
-        # oem 1 = LSTM, psm 6 = block of text
-        # preserve_interword_spaces ช่วยแก้ตัวอักษรติดกัน เช่น A๒ → A 2
-        text = pytesseract.image_to_string(
-            img, lang="tha+eng",
-            config="--oem 1 --psm 6 -c preserve_interword_spaces=1"
-        )
+        text = pytesseract.image_to_string(img, lang="tha+eng",
+            config="--oem 1 --psm 6 -c preserve_interword_spaces=1")
         all_text.append(text)
         progress.progress((i + 1) / total, text=f"OCR หน้า {i+1}/{total}")
     progress.empty()
     doc.close()
     return "\n\n".join(all_text)
+
+def ocr_pdf(file_bytes, label=""):
+    """OCR ด้วย Tesseract"""
+    return ocr_with_tesseract(file_bytes, label=label)
 
 _THAI_DIGITS = str.maketrans("๐๑๒๓๔๕๖๗๘๙", "0123456789")
 
@@ -455,7 +455,7 @@ def process_one(uploaded_file):
                 all_texts.append(f"=== {fn} ===\n{t}")
             else:
                 st.info(f"{fn} — PDF สแกน, OCR ด้วย Tesseract")
-                t = ocr_with_tesseract(pdf_b, label=fn)
+                t = ocr_pdf(pdf_b, label=fn)
                 all_texts.append(f"=== {fn} ===\n{t}")
         text = "\n\n".join(all_texts)
         source_label = ", ".join(filenames)
@@ -467,7 +467,7 @@ def process_one(uploaded_file):
         text = extract_text_from_pdf(pdf_bytes)
         if not (text and len(text) > 100):
             st.info("PDF สแกน — OCR ด้วย Tesseract")
-            text = ocr_with_tesseract(pdf_bytes, label=project_id)
+            text = ocr_pdf(pdf_bytes, label=project_id)
         else:
             st.info("PDF พิมพ์ — อ่านข้อความโดยตรง")
 
