@@ -9,6 +9,12 @@ from docx.oxml import OxmlElement
 import os as _os
 import io, zipfile, re, json as _json, base64
 import requests as _requests
+try:
+    from google import genai as _genai
+    from google.genai import types as _gtypes
+    _GEMINI_AVAILABLE = True
+except ImportError:
+    _GEMINI_AVAILABLE = False
 from datetime import datetime
 
 st.set_page_config(page_title="TOR Summarizer", page_icon="bb.png", layout="wide")
@@ -85,12 +91,24 @@ with st.sidebar:
         st.info(f"ติดตั้งโมเดลนี้ด้วย:\n`ollama pull {SELECTED_MODEL}`")
 
     st.divider()
+    st.header("OCR with Google Vision")
+    GEMINI_KEY = st.text_input("API Key", type="password", placeholder="AIza...",
+        help="ใช้สำหรับอ่าน PDF สแกน แม่นกว่า Tesseract \nรับฟรีที่ aistudio.google.com")
+    if not GEMINI_KEY:
+        st.caption("⚠️ ไม่มี Gemini Key → ใช้ Tesseract แทน")
+    else:
+        st.caption("✅ Google Vision OCR พร้อมใช้งาน")
+
+    st.divider()
     st.header("📂 เกี่ยวกับเว็บไซต์")
     st.caption("เว็บไซต์นี้เป็นเครื่องมือเพื่อช่วยสรุปเอกสาร Terms of Reference (TOR) อัตโนมัติเพื่อลดเวลาและภาระในการสรุปเอกสารทั้งหมด พร้อมนำออกในรูปแบบ Word/PDF รวมทุกโครงการ\n\n**หมายเหตุ:** ผลลัพธ์ที่ได้อาจมีความคลาดเคลื่อน ควรตรวจสอบกับเอกสารต้นฉบับอีกครั้ง")
     st.divider()
     st.header("🛠️ เครื่องมือที่ใช้")
     st.caption(f"**{_chosen_label}** — สรุป")
-    st.caption("**Tesseract** — OCR")
+    if GEMINI_KEY:
+        st.caption("**Google Vision** — OCR")
+    else:
+        st.caption("**Tesseract** — OCR")
 
 # Helper
 # ชื่อไฟล์ที่รู้ชัดว่าไม่ใช่ TOR
@@ -179,19 +197,61 @@ def extract_text_from_pdf(file_bytes):
     except Exception:
         return ""
 
+def ocr_with_gemini(file_bytes, gemini_key, label=""):
+    """ส่ง PDF ทั้งไฟล์ให้ Gemini อ่าน — 1 request ต่อไฟล์ ไม่กิน quota เยอะ"""
+    import time, re as _re
+    client = _genai.Client(api_key=gemini_key)
+    with st.spinner(f"Google Vision อ่าน {label} (1 request)..."):
+        for attempt in range(5):
+            try:
+                resp = client.models.generate_content(
+                    model="gemini-2.5-flash-lite",
+                    contents=[
+                        _gtypes.Part.from_bytes(data=file_bytes, mime_type="application/pdf"),
+                        "อ่านและถอดข้อความทั้งหมดจาก PDF นี้ให้ครบถ้วนทุกหน้า รักษาโครงสร้างเดิม ห้ามสรุปหรือตัดทอน"
+                    ]
+                )
+                raw = resp.text
+                # Gemini บางครั้งคืนเป็น JSON array — ดึงเฉพาะ text field
+                if raw.strip().startswith('[') or raw.strip().startswith('{'):
+                    try:
+                        import json as _j
+                        data = _j.loads(raw)
+                        if isinstance(data, list):
+                            raw = "\n\n".join(
+                                item.get("text", str(item)) if isinstance(item, dict) else str(item)
+                                for item in data
+                            )
+                        elif isinstance(data, dict):
+                            raw = data.get("text", raw)
+                    except Exception:
+                        pass
+                return raw
+            except Exception as e:
+                msg = str(e)
+                if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                    wait = 65
+                    m = _re.search(r"retry.{0,10}after[^\d]*(\d+)", msg, _re.IGNORECASE)
+                    if m: wait = int(m.group(1)) + 2
+                    st.warning(f"รอ {min(wait,120)} วินาที...")
+                    time.sleep(min(wait, 120))
+                else:
+                    st.error(f"❌ Google Vision error: {e}"); return ""
+    return ""
+
 def ocr_with_tesseract(file_bytes, label=""):
+    """Fallback OCR ด้วย Tesseract"""
     try:
         import pytesseract, numpy as np
         _tess_win = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
         if _os.path.exists(_tess_win):
             pytesseract.pytesseract.tesseract_cmd = _tess_win
     except ImportError:
-        st.error("ไม่พบ pytesseract — ติดตั้งด้วย: pip install pytesseract")
-        return ""
+        st.error("❌ ไม่พบ pytesseract"); return ""
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     total = len(doc)
     all_text = []
-    progress = st.progress(0, text=f"กำลัง OCR {label} ด้วย Tesseract ({total} หน้า)")
+    progress = st.progress(0, text=f"OCR {label} ด้วย Tesseract ({total} หน้า)")
     for i in range(total):
         page = doc[i]
         pix = page.get_pixmap(matrix=fitz.Matrix(200/72, 200/72))
@@ -200,14 +260,85 @@ def ocr_with_tesseract(file_bytes, label=""):
             config="--oem 1 --psm 6 -c preserve_interword_spaces=1")
         all_text.append(text)
         progress.progress((i + 1) / total, text=f"OCR หน้า {i+1}/{total}")
-    progress.empty()
-    doc.close()
+    progress.empty(); doc.close()
     return "\n\n".join(all_text)
 
 def ocr_pdf(file_bytes, label=""):
-    """OCR ด้วย Tesseract"""
+    """เลือก OCR อัตโนมัติ — Google Vision ถ้ามี Key, Tesseract ถ้าไม่มี"""
+    gkey = GEMINI_KEY if "GEMINI_KEY" in globals() else ""
+    if gkey and _GEMINI_AVAILABLE:
+        return ocr_with_gemini(file_bytes, gkey, label=label)
     return ocr_with_tesseract(file_bytes, label=label)
 
+def extract_spec_raw(text: str) -> str:
+    """ดึงเฉพาะส่วนคุณลักษณะเฉพาะของสินค้า (ข้อ ๔) ไม่เอาหลักการ/คุณสมบัติ/เงื่อนไข"""
+    import re as _re
+
+    # แยกไฟล์ใน ZIP ออกจากกัน เอาเฉพาะ part ที่มีสเปคสินค้า
+    parts = _re.split(r'={10,}', text)
+    spec_parts = [p for p in parts if any(kw in p for kw in
+        ["คุณลักษณะทั่วไป", "คุณลักษณะทางเทคนิค",
+         "รายละเอียดคุณลักษณะเฉพาะ", "ข้อกำหนดทางเทคนิค",
+         "คุณลักษณะเฉพาะหรือขอบเขต"])]
+    work_text = "\n".join(spec_parts) if spec_parts else text
+
+    lines = work_text.split("\n")
+    start_idx = None
+
+    START_RE = [
+        r"[๔4][\.,\s]+รายละเอียดคุณลักษณะ",
+        r"[๔4][\.,\s]+คุณลักษณะเฉพาะ",
+        r"[๔4][\.,\s]+คุณลักษณะ",
+        r"คุณลักษณะทั่วไป\s+มีอย่างน้อย",
+        r"คุณลักษณะทางเทคนิค\s+มีอย่างน้อย",
+        r"[๔4][\.,][๑1][\.,]\s*คุณลักษณะ",
+    ]
+    END_KW = [
+        "กำหนดเวลาส่งมอบ", "ระยะเวลาส่งมอบ",
+        "หลักเกณฑ์ในการพิจารณา", "หลักเกณฑ์การพิจารณา",
+        "หลักฐานการยื่นข้อเสนอ", "การเสนอราคา",
+        "การทำสัญญา", "ค่าจ้างและการจ่าย", "อัตราค่าปรับ",
+        "บัญชีเอกสาร", "คุณสมบัติของผู้ยื่น", "คุณสมบัติผู้เสนอ",
+    ]
+    NOISE_RE = [
+        r"^ประธานกรรมการ", r"^กรรมการ\s*ลงชื่อ", r"^ลงชื่อ[.\s]",
+        r"^\(นาย", r"^\(นาง", r"^\(น\.ส\.",
+        r"^\[Page\s+\d+\]", r"^-[๐-๙0-9]+-$",
+    ]
+
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if any(_re.search(p, s) for p in START_RE):
+            start_idx = i; break
+        if _re.match(r"[๔4][.][๑1]", s) and "คุณลักษณะ" in s:
+            start_idx = i; break
+
+    if start_idx is None:
+        return ""
+
+    spec_lines = []
+    for line in lines[start_idx:]:
+        s = line.strip()
+        if s and any(kw in s for kw in END_KW):
+            break
+        if s and any(_re.match(p, s) for p in NOISE_RE):
+            continue
+        if len(s) > 8:
+            ok = sum(1 for c in s if "\u0e00" <= c <= "\u0e7f" or c.isalnum() or c in " .,()%:-x/°")
+            if ok / len(s) < 0.20:
+                continue
+        spec_lines.append(line)
+
+    cleaned, prev_blank = [], False
+    for ln in spec_lines:
+        blank = ln.strip() == ""
+        if blank and prev_blank:
+            continue
+        cleaned.append(ln)
+        prev_blank = blank
+
+    result = "\n".join(cleaned).strip()
+    return result if len(result) > 100 else ""
 _THAI_DIGITS = str.maketrans("๐๑๒๓๔๕๖๗๘๙", "0123456789")
 
 def _to_arabic(text: str) -> str:
@@ -293,59 +424,77 @@ def extract_budget_by_regex(text: str) -> dict:
     return result
 
 def summarize_tor(text, api_key="", project_id=""):
-    # ดึงงบ/ระยะเวลาด้วย regex 
     extracted = extract_budget_by_regex(text)
     budget_fact = extracted["budget"] or "ไม่พบในเอกสาร"
     duration_fact = extracted["duration"] or "ไม่พบในเอกสาร"
+    _model = SELECTED_MODEL if "SELECTED_MODEL" in globals() else "llama3.2"
+    is_pathumma = "pathumma" in _model.lower()
 
-    prompt = f"""คุณเป็นผู้เชี่ยวชาญด้านการวิเคราะห์เอกสาร TOR (Terms of Reference) ภาษาไทย
-อ่านเนื้อหาต่อไปนี้แล้วสรุปเป็นภาษาไทย แบ่งเป็นหัวข้อดังนี้:
+    prompt_general = f"""คุณเป็นผู้เชี่ยวชาญด้านการวิเคราะห์เอกสาร TOR (Terms of Reference) ของราชการไทย
+
+กฎสำคัญ:
+- ดึงข้อมูลจากเอกสารเท่านั้น ห้ามแต่งหรือเดา
+- ถ้าไม่พบในหัวข้อใด ให้เขียนว่า "ไม่ระบุในเอกสาร"
+- ตอบเป็นภาษาไทย ยกเว้นคำเทคนิคภาษาอังกฤษให้คงไว้
+
+สรุปเอกสาร TOR นี้:
 
 **รหัสโครงการ:** {project_id}
-**ชื่อโครงการ**
-**หน่วยงาน**
-**วัตถุประสงค์** (2-3 บรรทัด)
-**ขอบเขตงาน** (2-3 บรรทัด)
-**คุณสมบัติผู้รับจ้าง** (เฉพาะข้อสำคัญ)
-**คุณลักษณะเฉพาะ** — สรุปสเปค/รายละเอียดคุณลักษณะทางเทคนิค เช่น ขนาด ปริมาณ มาตรฐาน ความสามารถ หรือข้อกำหนดพิเศษ ที่ระบุในเอกสาร ไม่ต้องหัวข้อตามนี้ก็ได้
+**ชื่อโครงการ:**
+**หน่วยงานเจ้าของโครงการ:**
+**วัตถุประสงค์:**
+**ขอบเขตงาน:**
+**คุณสมบัติผู้รับจ้าง:**
 **วงเงินงบประมาณ:** {budget_fact}
 **ระยะเวลาดำเนินงาน:** {duration_fact}
-**เงื่อนไขสำคัญ** (2-3 ข้อ)
+**เงื่อนไขสำคัญ:**
 
 เนื้อหาเอกสาร:
 {text[:3000]}
 """
     try:
-        _model = SELECTED_MODEL if "SELECTED_MODEL" in globals() else "llama3.2"
         status = st.empty()
-        status.info("กำลังสรุปเอกสาร... กรุณารอสักครู่")
-        resp = _requests.post(
-            "http://localhost:11434/api/generate",
-            json={
-                "model": _model,
-                "prompt": prompt,
-                "stream": True,
-                "options": {"num_predict": 1200, "num_ctx": 4096, "temperature": 0.1}
-            },
-            stream=True,
-            timeout=(10, 1200)
-        )
+        status.info(f"⏳ [{_model.split('/')[-1].split(':')[0]}] กำลังสรุป...")
+        if is_pathumma:
+            resp = _requests.post("http://localhost:11434/api/chat",
+                json={"model": _model, "messages": [
+                    {"role": "system", "content": "คุณเป็นผู้เชี่ยวชาญด้านการวิเคราะห์เอกสาร TOR ของราชการไทย ตอบเป็นภาษาไทยเสมอ ห้ามแต่งข้อมูลที่ไม่มีในเอกสาร"},
+                    {"role": "user", "content": prompt_general}
+                ], "stream": True, "options": {"num_predict": 2000, "num_ctx": 4096, "temperature": 0.1}},
+                stream=True, timeout=(10, 1200))
+        else:
+            resp = _requests.post("http://localhost:11434/api/generate",
+                json={"model": _model, "prompt": prompt_general, "stream": True,
+                      "options": {"num_predict": 2000, "num_ctx": 4096, "temperature": 0.1}},
+                stream=True, timeout=(10, 1200))
         resp.raise_for_status()
-        result = ""
+        summary_general = ""
         for line in resp.iter_lines():
             if line:
-                chunk = _json.loads(line)
-                result += chunk.get("response", "")
-                if chunk.get("done"):
-                    break
+                try:
+                    chunk = _json.loads(line)
+                    if is_pathumma:
+                        summary_general += chunk.get("message", {}).get("content", "")
+                    else:
+                        summary_general += chunk.get("response", "")
+                    if chunk.get("done"): break
+                except _json.JSONDecodeError:
+                    continue
         status.empty()
-        return result
     except _requests.exceptions.ConnectionError:
-        st.error("ไม่พบ Ollama — กรุณาเปิด Ollama ก่อนแล้วลองใหม่")
-        return ""
+        st.error("❌ ไม่พบ Ollama — กรุณาเปิด Ollama ก่อน"); return ""
     except Exception as e:
-        st.error(f"Ollama error: {e}")
+        st.error(f"❌ Ollama error: {e}"); return ""
+
+    if not summary_general:
         return ""
+
+    # ส่วนคุณลักษณะเฉพาะ ไม่ตัดทอน
+    spec_raw = extract_spec_raw(text)
+    spec_out = ("\n\n---\n**📋 คุณลักษณะเฉพาะ (ข้อความจากเอกสาร)**\n\n" + spec_raw
+                if spec_raw else "\n\n---\n**📋 คุณลักษณะเฉพาะ**\nไม่พบในเอกสาร")
+
+    return summary_general.strip() + spec_out
 
 # Export Word
 def add_page_break(doc):
@@ -388,9 +537,17 @@ def build_combined_word(results):
                 doc.add_paragraph(); continue
             if line.startswith("**") and line.endswith("**"):
                 hh = doc.add_heading(line.replace("**", ""), level=2)
-                hh.runs[0].font.color.rgb = RGBColor(0x0f, 0x34, 0x60)
+                if hh.runs: hh.runs[0].font.color.rgb = RGBColor(0x0f, 0x34, 0x60)
+            elif line.startswith("# ") or line.startswith("📋"):
+                # spec header
+                hh = doc.add_heading(line.lstrip("# "), level=2)
+                if hh.runs: hh.runs[0].font.color.rgb = RGBColor(0x0f, 0x34, 0x60)
             elif line.startswith("- ") or line.startswith("• "):
                 doc.add_paragraph(style="List Bullet").add_run(line[2:])
+            elif line.startswith("===") or line.startswith("---"):
+                # separator
+                p = doc.add_paragraph()
+                p.add_run("─" * 40)
             else:
                 p = doc.add_paragraph()
                 for i, part in enumerate(line.split("**")):

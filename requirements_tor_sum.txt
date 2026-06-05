@@ -9,3 +9,4 @@ pandas
 openpyxl
 xlsxwriter
 aifts
+google-genai
